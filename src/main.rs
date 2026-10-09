@@ -9,9 +9,11 @@ use std::io::Write;
 use std::mem::size_of;
 use std::sync::{Mutex, OnceLock};
 
-use windows::core::{w, Result};
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::core::{w, BOOL, Result};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::HiDpi::{SetThreadDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
     RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
@@ -23,10 +25,10 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CallNextHookEx, CreateWindowExW, CreatePopupMenu, DefWindowProcW,
-    DestroyMenu, DestroyWindow, DispatchMessageW, GetAncestor, GetClassNameW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowExW, GetClassNameW, GetWindowRect,
     GetCursorPos, GetMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
     SetWindowsHookExW, ShowWindow, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx,
-    WindowFromPoint, CreateIconFromResourceEx, GA_ROOT, HICON, MENU_ITEM_FLAGS, MF_CHECKED,
+    CreateIconFromResourceEx, HICON, MENU_ITEM_FLAGS, MF_CHECKED,
     MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, SW_HIDE,
     TPM_RIGHTBUTTON, WH_MOUSE_LL, WM_COMMAND, WM_DESTROY, WM_MOUSEWHEEL, WM_RBUTTONUP,
     WNDCLASSW, WS_OVERLAPPED, MB_ICONERROR, MB_OK, MessageBoxW,
@@ -55,6 +57,8 @@ fn main() {
 fn run() -> Result<()> {
     unsafe {
         initialize_log();
+        // Mouse hook coordinates are physical pixels; use the same units for window rectangles.
+        let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         log("starting Taskbar Volume");
         log("using Windows media keys so the native volume flyout is shown");
 
@@ -220,12 +224,12 @@ unsafe fn set_autostart(enabled: bool) -> Result<()> {
 
 unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code >= 0 && wparam.0 as u32 == WM_MOUSEWHEEL {
-        let (on_taskbar, class_name) = cursor_taskbar_state();
+        let hook_data = *(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::MSLLHOOKSTRUCT);
+        let (on_taskbar, class_name) = cursor_taskbar_state(hook_data.pt);
         log(&format!("wheel received: taskbar={on_taskbar}, target={class_name}"));
         if !on_taskbar {
             return CallNextHookEx(None, code, wparam, lparam);
         }
-        let hook_data = *(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::MSLLHOOKSTRUCT);
         let delta = ((hook_data.mouseData >> 16) as i16) as f32;
         if delta != 0.0 {
             let key = if delta > 0.0 { VK_VOLUME_UP } else { VK_VOLUME_DOWN };
@@ -239,18 +243,86 @@ unsafe extern "system" fn mouse_hook(code: i32, wparam: WPARAM, lparam: LPARAM) 
     CallNextHookEx(None, code, wparam, lparam)
 }
 
-unsafe fn cursor_taskbar_state() -> (bool, String) {
-    let mut point = POINT::default();
-    if GetCursorPos(&mut point).is_err() {
-        return (false, "GetCursorPos failed".to_owned());
+struct TaskbarHit {
+    point: POINT,
+    found: bool,
+}
+
+unsafe fn cursor_taskbar_state(point: POINT) -> (bool, String) {
+    let previous_dpi = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    let mut hit = TaskbarHit { point, found: false };
+    for class in [w!("Shell_TrayWnd"), w!("Shell_SecondaryTrayWnd")] {
+        let mut after = None;
+        while let Ok(window) = FindWindowExW(None, after, class, None) {
+            if window.0.is_null() { break; }
+            let _ = check_taskbar(window, LPARAM((&mut hit as *mut TaskbarHit) as isize));
+            after = Some(window);
+        }
     }
-    let window = GetAncestor(WindowFromPoint(point), GA_ROOT);
-    if window.0.is_null() {
-        return (false, "no window".to_owned());
+    if !previous_dpi.0.is_null() {
+        let _ = SetThreadDpiAwarenessContext(previous_dpi);
     }
+    (hit.found, format!("taskbar region at {},{}", point.x, point.y))
+}
+
+unsafe extern "system" fn check_taskbar(window: HWND, parameter: LPARAM) -> BOOL {
+    let hit = &mut *(parameter.0 as *mut TaskbarHit);
     let mut class_name = [0u16; 128];
     let copied = GetClassNameW(window, &mut class_name);
     let name = String::from_utf16_lossy(&class_name[..copied as usize]);
-    let is_taskbar = name == "Shell_TrayWnd" || name == "Shell_SecondaryTrayWnd";
-    (is_taskbar, name)
+    if name != "Shell_TrayWnd" && name != "Shell_SecondaryTrayWnd" {
+        return BOOL(1);
+    }
+    let mut rect = RECT::default();
+    if GetWindowRect(window, &mut rect).is_err() {
+        return BOOL(1);
+    }
+    let mut monitor = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    if GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut monitor).as_bool() {
+        // Extend a bottom taskbar through the last pixel of its own monitor.
+        // Restrict X as well, so a taskbar on another monitor cannot match.
+        if rect.bottom >= monitor.rcMonitor.bottom - 2 && rect.top < monitor.rcMonitor.bottom {
+            rect.bottom = monitor.rcMonitor.bottom;
+            rect.left = monitor.rcMonitor.left;
+            rect.right = monitor.rcMonitor.right;
+        }
+    }
+    if contains_point(rect, hit.point) {
+        hit.found = true;
+    }
+    log(&format!("taskbar rect={},{},{},{} point={},{} hit={}", rect.left, rect.top, rect.right, rect.bottom, hit.point.x, hit.point.y, hit.found));
+    BOOL(1)
+}
+
+fn contains_point(rect: RECT, point: POINT) -> bool {
+    point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a live Windows Explorer taskbar"]
+    fn live_taskbar_center_is_detected() {
+        unsafe {
+            let _ = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            let window = FindWindowExW(None, None, w!("Shell_TrayWnd"), None).unwrap();
+            assert!(!window.0.is_null());
+            let mut rect = RECT::default();
+            GetWindowRect(window, &mut rect).unwrap();
+            let point = POINT { x: (rect.left + rect.right) / 2, y: rect.bottom - 1 };
+            assert!(cursor_taskbar_state(point).0, "taskbar bottom pixel was not detected");
+        }
+    }
+
+    #[test]
+    fn bottom_edge_and_taskbar_top_are_included() {
+        let rect = RECT { left: -1920, top: 1032, right: 0, bottom: 1080 };
+        assert!(contains_point(rect, POINT { x: -1, y: 1079 }));
+        assert!(contains_point(rect, POINT { x: -1920, y: 1032 }));
+        assert!(!contains_point(rect, POINT { x: -1, y: 1031 }));
+        assert!(!contains_point(rect, POINT { x: 0, y: 1079 }));
+        assert!(!contains_point(rect, POINT { x: -1, y: 1080 }));
+    }
 }
